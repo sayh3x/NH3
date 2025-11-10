@@ -460,6 +460,4 @@ void sendToThingSpeak(float ppm) {
 
 برای سوالات و مشکلات:
 - GitHub Issues
-- ایمیل: your.email@example.com
-
 **موفق باشید! 🚀**
