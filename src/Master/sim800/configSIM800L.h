@@ -3,7 +3,7 @@
 
 // Debug flags
 #define SERIAL_LOG_LEVEL 2 // Set to 0 to disable printing messages on Serial, set to 1 for important messages, set to 2 for verbose.
-#define PRINT_RAW_AT 1     // Set to 0 to disable AT command logging or 1 to show AT Command
+#define PRINT_RAW_AT 0     // Set to 0 to disable AT command logging or 1 to show AT Command
 
 // Timings (in milliseconds)
 #define SMS_CHECK_INTERVAL 60000     // 1 minute
@@ -25,6 +25,6 @@
 #define MODEM_RX_PIN 16      // ESP32 pin connected to SIM800L TX
 #define MODEM_TX_PIN 17      // ESP32 pin connected to SIM800L RX
 #define MODEM_RST_PIN 5      // Reset pin
-#define MODEM_PWRKEY_PIN 0  // Power key pin
-#define MODEM_PWR_EXT_PIN 0 // External power control pin
+#define MODEM_PWRKEY_PIN -1  // Power key pin
+#define MODEM_PWR_EXT_PIN -1 // External power control pin
 #define MODEM_BAUD_RATE 9600
