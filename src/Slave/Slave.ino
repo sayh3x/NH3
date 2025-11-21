@@ -1,441 +1,323 @@
 /*
- * NodeMCU Sensor Node - MESH Network (Modified)
- * Changes:
- *  - send via broadcast instead of sendSingle to gatewayId
- *  - setContainsRoot(true)
- *  - improved seq and retry handling
- */
+  NH3 Display (aligned labels+values, partial updates)
+  NodeMCU (ESP8266) + MEMS_NH3 + GC9A01 240x240
+*/
 
-#include <painlessMesh.h>
-#include <DHT.h>
+#include <Arduino_GFX_Library.h>
+#include "MEMS_NH3.h"
+#include <math.h>
+#include <stdio.h>
 
-// ============ MESH CONFIG ============
-#define MESH_PREFIX "SensorMesh"
-#define MESH_PASSWORD "mesh12345"
-#define MESH_PORT 5555
+// ---------------- TFT 1.28" GC9A01 ----------------
+#define TFT_DC   D1
+#define TFT_CS   D8
+#define TFT_RST  D2
 
-// ============ NODE CONFIG ============
-#define NODE_ID "node01"
-#define ROOM_NAME "room1"
-#define SENSOR_TYPE "temp"
+Arduino_DataBus *bus = new Arduino_ESP8266SPI(TFT_DC, TFT_CS);
+Arduino_GFX *gfx = new Arduino_GC9A01(bus, TFT_RST, 0, true);
 
-// ============ DHT SENSOR CONFIG ============
-#define DHT_PIN D4
-#define DHT_TYPE DHT11
-DHT dht(DHT_PIN, DHT_TYPE);
+// ---------------- NH3 Sensor ----------------
+MEMS_NH3 sensor(A0, 4700, 3.3, -1.53, 1.35);
 
-// ============ BUZZER CONFIG ============
-#define BUZZER_PIN D5
-#define ALERT_DURATION 10000
+// ---------- UI / layout state ----------
+int16_t scr_w, scr_h;
+int16_t cx, cy, radius;
 
-// ============ ALERT THRESHOLDS ============
-#define TEMP_HIGH 30.0
-#define TEMP_LOW 10.0
-#define HUM_HIGH 80.0
-#define HUM_LOW 20.0
+// color constants (fallbacks in case library doesn't provide)
+#ifndef RGB565_BLACK
+  #define RGB565_BLACK 0x0000
+#endif
+#ifndef RGB565_WHITE
+  #define RGB565_WHITE 0xFFFF
+#endif
+#ifndef RGB565_YELLOW
+  #define RGB565_YELLOW 0xFFE0
+#endif
+#ifndef RGB565_CYAN
+  #define RGB565_CYAN 0x07FF
+#endif
+#ifndef RGB565_ORANGE
+  #define RGB565_ORANGE 0xFD20
+#endif
+#ifndef RGB565_GREEN
+  #define RGB565_GREEN 0x07E0
+#endif
+#ifndef RGB565_RED
+  #define RGB565_RED 0xF800
+#endif
 
-// ============ TIMING CONFIG ============
-#define SEND_INTERVAL 30000 // send every 30 seconds (adjustable)
-#define ACK_TIMEOUT 8000    // ACK timeout (increased for multi-hop)
-#define MAX_RETRY 3
+const uint16_t BG_COLOR = RGB565_BLACK;
+const uint16_t LABEL_COLOR = RGB565_WHITE;
+const uint16_t PPM_COLOR = RGB565_CYAN;
+const uint16_t RS_COLOR = RGB565_ORANGE;
+const uint16_t RATIO_COLOR = RGB565_YELLOW;
+const uint16_t TWA_COLOR = RGB565_GREEN;
+const uint16_t ALERT_SAFE = RGB565_GREEN;
+const uint16_t ALERT_CAUTION = RGB565_YELLOW;
+const uint16_t ALERT_WARNING = RGB565_ORANGE;
+const uint16_t ALERT_DANGER = RGB565_RED;
 
-// ============ VARIABLES ============
-Scheduler userScheduler;
-painlessMesh mesh;
+// store previous values to do partial updates
+float prev_ppm = NAN;
+float prev_rs = NAN;
+float prev_ratio = NAN;
+float prev_twa = NAN;
+int prev_alert = -1;
 
-uint16_t messageSeq = 0;
-bool waitingForAck = false;
-uint32_t lastAckTime = 0;
-uint8_t retryCount = 0;
+// areas for partial update (computed in setup)
+struct Area { int16_t x, y, w, h; };
+Area areaPPM, areaRs, areaRatio, areaTWA, areaAlert;
 
-float lastTemp = 0;
-float lastHum = 0;
-unsigned long buzzerStartTime = 0;
-bool buzzerActive = false;
+// label/value layout params (tweak these if you like)
+const char *labels[] = { "PPM:", "Rs:", "Ratio:", "TWA:", "Alert:" };
+const uint8_t LABEL_TEXTSIZE = 1;   // labels font size
+const uint8_t VAL_TEXTSIZE_PPM = 2; // PPM bigger
+const uint8_t VAL_TEXTSIZE_OTHER = 1;
+const int16_t LEFT_MARGIN = 20;     // distance from left edge of screen to label column
+const int16_t LABEL_VAL_PADDING = 6; // px between label and value
 
-// store last message/seq for retry
-String lastMessage = "";
-String lastSeqString = "";
-bool lastWasHello = false;
+// thresholds to decide if we redraw a value
+const float TH_PPM = 0.01;   // small threshold for ppm (adjust if noisy)
+const float TH_RS  = 1.0;    // ohms
+const float TH_RATIO = 0.01;
+const float TH_TWA = 0.01;
 
-void sendSensorData();
-void checkAckTimeout();
+unsigned long lastReadMillis = 0;
+const unsigned long READ_INTERVAL = 800; // ms, update rate (adjust as wanted)
 
-// ============ TASKS ============
-Task taskSendSensor(SEND_INTERVAL, TASK_FOREVER, &sendSensorData);
-Task taskCheckAck(ACK_TIMEOUT, TASK_FOREVER, &checkAckTimeout);
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-// Read sensor
-void readSensor(float &temp, float &hum)
-{
-    temp = dht.readTemperature();
-    hum = dht.readHumidity();
-
-    if (isnan(temp))
-        temp = 10;
-    if (isnan(hum))
-        hum = 20;
+// helper to clear an area (fill with bg)
+inline void clearArea(const Area &a) {
+  gfx->startWrite();
+  gfx->fillRect(a.x, a.y, a.w, a.h, BG_COLOR);
+  gfx->endWrite();
 }
 
-// Check thresholds
-bool checkThresholdAlert(float temp, float hum)
-{
-    bool alert = false;
-
-    if (temp > TEMP_HIGH || temp < TEMP_LOW)
-    {
-        alert = true;
-    }
-
-    if (hum > HUM_HIGH || hum < HUM_LOW)
-    {
-        alert = true;
-    }
-
-    return alert;
+// helper to draw text into area (we assume area big enough)
+void drawValueAt(int16_t x, int16_t y, const char *txt, uint16_t color, uint8_t textSize=2) {
+  gfx->startWrite();
+  gfx->setTextSize(textSize);
+  gfx->setTextColor(color);
+  gfx->setCursor(x, y);
+  gfx->print(txt);
+  gfx->endWrite();
 }
 
-// Activate buzzer
-void activateBuzzer()
-{
-    digitalWrite(BUZZER_PIN, HIGH);
-    buzzerStartTime = millis();
-    buzzerActive = true;
-    Serial.println("Buzzer activated!");
+// calculate pixel width of a string in default font: approx chars * 6 * textSize
+inline int textPixelWidth(const char *s, uint8_t textSize) {
+  return strlen(s) * 6 * textSize;
 }
 
-// Deactivate buzzer
-void deactivateBuzzer()
+void drawStaticBackground()
 {
-    digitalWrite(BUZZER_PIN, LOW);
-    buzzerActive = false;
-    Serial.println("Buzzer deactivated.");
+  gfx->fillScreen(BG_COLOR);
+
+  // Draw main circle (so content obviously inside)
+  gfx->fillCircle(cx, cy, radius, BG_COLOR);
+  gfx->drawCircle(cx, cy, radius - 1, RGB565_WHITE);
+
+  // Title (top)
+  gfx->setTextSize(2);
+  gfx->setTextColor(LABEL_COLOR);
+  gfx->setCursor(cx - 25, cy - radius + 16);
+  gfx->print("NH3");
+
+  // static labels column
+  gfx->setTextSize(LABEL_TEXTSIZE);
+  gfx->setTextColor(LABEL_COLOR);
+
+  int16_t labelX = LEFT_MARGIN;
+  int16_t startY = cy - 40;
+  int16_t step = 26;
+
+  for (uint8_t i = 0; i < 5; i++) {
+    gfx->setCursor(labelX, startY + i * step);
+    gfx->print(labels[i]);
+  }
 }
 
-// Build HELLO message and prepare lastMessage (for potential ACK)
-String buildHelloMessage()
+void computeAreas()
 {
-    String msg = "HELLO|";
-    msg += NODE_ID;
-    msg += "|";
-    msg += ROOM_NAME;
-    msg += "|";
-    msg += SENSOR_TYPE;
+  // compute labelX and valueX (value starts after label + padding)
+  int16_t labelX = LEFT_MARGIN;
+  int16_t startY = cy - 40;
+  int16_t step = 26;
 
-    Serial.println("Prepared HELLO: " + msg);
-    return msg;
+  // For each field compute area that will hold the value (we'll clear this area when updating)
+  // area width chosen large enough to hold number string; adjust if needed
+  int16_t maxValW = 120;
+  int16_t valH = 18;
+
+  // PPM (bigger text, so slightly taller)
+  int16_t labelW0 = textPixelWidth(labels[0], LABEL_TEXTSIZE);
+  int16_t valueX0 = labelX + labelW0 + LABEL_VAL_PADDING;
+  areaPPM = { valueX0, startY - 2, maxValW, valH + 8 };
+
+  // Rs
+  int16_t labelW1 = textPixelWidth(labels[1], LABEL_TEXTSIZE);
+  int16_t valueX1 = labelX + labelW1 + LABEL_VAL_PADDING;
+  areaRs = { valueX1, startY + step - 2, maxValW, valH };
+
+  // Ratio
+  int16_t labelW2 = textPixelWidth(labels[2], LABEL_TEXTSIZE);
+  int16_t valueX2 = labelX + labelW2 + LABEL_VAL_PADDING;
+  areaRatio = { valueX2, startY + step*2 - 2, maxValW, valH };
+
+  // TWA
+  int16_t labelW3 = textPixelWidth(labels[3], LABEL_TEXTSIZE);
+  int16_t valueX3 = labelX + labelW3 + LABEL_VAL_PADDING;
+  areaTWA = { valueX3, startY + step*3 - 2, maxValW, valH };
+
+  // Alert
+  int16_t labelW4 = textPixelWidth(labels[4], LABEL_TEXTSIZE);
+  int16_t valueX4 = labelX + labelW4 + LABEL_VAL_PADDING;
+  areaAlert = { valueX4, startY + step*4 - 2, maxValW, valH };
 }
 
-// Prepare (new) DATA message: increments seq and stores lastMessage/lastSeqString
-String prepareNewDataMessage(float temp, float hum)
+void updateAlertDisplay(int alertLevel)
 {
-    messageSeq++; // increment only when creating a new message
-    lastSeqString = "seq" + String(messageSeq);
-
-    String msg = "DATA|";
-    msg += NODE_ID;
-    msg += "|";
-    msg += ROOM_NAME;
-    msg += "|";
-    msg += SENSOR_TYPE;
-    msg += "|";
-
-    if (String(SENSOR_TYPE) == "temp")
-    {
-        msg += String(temp, 1);
-    }
-    else if (String(SENSOR_TYPE) == "humidity")
-    {
-        msg += String(hum, 1);
-    }
-    else
-    {
-        msg += String(temp, 1) + "," + String(hum, 1);
-    }
-
-    msg += "|";
-    msg += String(millis()); // timestamp
-    msg += "|";
-    msg += lastSeqString;
-
-    lastMessage = msg;
-    lastWasHello = false;
-    return msg;
+  // map alert enum to color & string
+  const char *str;
+  uint16_t color;
+  switch (alertLevel) {
+    case SAFE: str = "SAFE"; color = ALERT_SAFE; break;
+    case CAUTION: str = "CAUTION"; color = ALERT_CAUTION; break;
+    case WARNING: str = "WARNING"; color = ALERT_WARNING; break;
+    case DANGER: str = "DANGER"; color = ALERT_DANGER; break;
+    default: str = "N/A"; color = LABEL_COLOR; break;
+  }
+  clearArea(areaAlert);
+  // vertically center calc: use areaAlert.y as top; pick small offset
+  drawValueAt(areaAlert.x, areaAlert.y + 2, str, color, 2);
 }
 
-// Prepare HELLO as lastMessage (registered ack returned as 'registered')
-String prepareHelloAsLast()
-{
-    String hello = buildHelloMessage();
-    lastMessage = hello;
-    lastSeqString = "registered"; // gateway returns 'registered' for HELLO ACK
-    lastWasHello = true;
-    return hello;
-}
-
-// Send lastMessage via broadcast (used for new send or retry)
-void sendLastMessage()
-{
-    if (lastMessage.length() == 0)
-    {
-        Serial.println("No lastMessage to send.");
-        return;
-    }
-    Serial.println("Broadcasting: " + lastMessage);
-    mesh.sendBroadcast(lastMessage);
-    waitingForAck = true;
-    lastAckTime = millis();
-    taskCheckAck.enable();
-}
-
-// Send a fresh data message (build + broadcast)
-void sendFreshData(float temp, float hum)
-{
-    prepareNewDataMessage(temp, hum);
-    sendLastMessage();
-}
-
-// ============================================================================
-// MESH CALLBACKS
-// ============================================================================
-
-// On message received
-void receivedCallback(uint32_t from, String &msg)
-{
-    Serial.println("\nMessage received from: " + String(from));
-    Serial.println("  Content: " + msg);
-
-    if (msg.startsWith("ACK|"))
-    {
-        // parse safely
-        String parts[5]; // expect at least 3 parts; 5 is sufficient
-        int idx = 0;
-        int lastPos = 0;
-
-        for (int i = 0; i < msg.length() && idx < 4; i++)
-        {
-            if (msg[i] == '|')
-            {
-                parts[idx++] = msg.substring(lastPos, i);
-                lastPos = i + 1;
-            }
-        }
-        // put the remainder into parts[idx]
-        if (idx < 4)
-            parts[idx] = msg.substring(lastPos);
-
-        // validate format (need parts[0], parts[1], parts[2] at minimum)
-        if (parts[0] != "ACK")
-        {
-            Serial.println("ACK format mismatch.");
-            return;
-        }
-
-        // ensure required indices exist
-        // parts[1] -> nodeId, parts[2] -> seq OR 'registered'
-        if (parts[1].length() == 0 || parts[2].length() == 0)
-        {
-            Serial.println("ACK missing fields.");
-            return;
-        }
-
-        // check ACK is for this node
-        if (parts[1] == NODE_ID)
-        {
-            // accept three cases:
-            //  - gateway replies 'registered' for HELLO
-            //  - or for DATA it replies with same seq (e.g., "seq3")
-            if (parts[2] == lastSeqString || (parts[2] == "registered" && lastWasHello))
-            {
-                Serial.println("ACK valid for this node: " + parts[2]);
-                waitingForAck = false;
-                retryCount = 0;
-                taskCheckAck.disable();
-                // optionally clear last message after ACK
-                lastMessage = "";
-                lastSeqString = "";
-                lastWasHello = false;
-            }
-            else
-            {
-                Serial.println("ACK seq didn't match. Received: " + parts[2] + " expected: " + lastSeqString);
-            }
-        }
-        else
-        {
-            Serial.println("ACK not for this node (id mismatch).");
-        }
-    }
-}
-
-// New connection detected
-void newConnectionCallback(uint32_t nodeId)
-{
-    Serial.println("New connection: " + String(nodeId));
-
-    // when a new connection appears, broadcast HELLO to register
-    delay(500);
-    String hello = prepareHelloAsLast();
-    sendLastMessage();
-}
-
-void changedConnectionCallback()
-{
-    Serial.println("Network connection status changed.");
-    // for debugging, print node list (optional)
-    auto nodeList = mesh.getNodeList();
-    Serial.print("NodeList: ");
-    for (const auto &nodeId : nodeList)
-    {
-        Serial.print(String(nodeId) + " ");
-    }
-    Serial.println();
-}
-
-void nodeTimeAdjustedCallback(int32_t offset)
-{
-    Serial.println("Network time adjusted. Offset: " + String(offset));
-}
-
-// ============================================================================
-// SEND / ACK TIMEOUT CHECK
-// ============================================================================
-
-void sendSensorData()
-{
-    // If previous ACK not received and retries remain, skip sending a new message
-    if (waitingForAck && retryCount < MAX_RETRY)
-    {
-        Serial.println("Waiting for previous ACK... (retry " + String(retryCount) + ")");
-        return;
-    }
-    else if (waitingForAck && retryCount >= MAX_RETRY)
-    {
-        // if retries exhausted, allow sending a new message (or consider resetting gateway)
-        Serial.println("Previous send failed after retries. Will attempt new send.");
-        waitingForAck = false;
-        retryCount = 0;
-        taskCheckAck.disable();
-    }
-
-    float temp, hum;
-    readSensor(temp, hum);
-
-    Serial.println("\nSensor Reading:");
-    Serial.println("  Temperature: " + String(temp, 1) + "°C");
-    Serial.println("  Humidity: " + String(hum, 1) + "%");
-
-    // Threshold check
-    if (checkThresholdAlert(temp, hum))
-    {
-        activateBuzzer();
-    }
-
-    // store for possible retry
-    lastTemp = temp;
-    lastHum = hum;
-
-    // prepare & send
-    sendFreshData(temp, hum);
-}
-
-void checkAckTimeout()
-{
-    if (!waitingForAck)
-    {
-        taskCheckAck.disable();
-        return;
-    }
-
-    if (millis() - lastAckTime > ACK_TIMEOUT)
-    {
-        retryCount++;
-        Serial.println("ACK not received! Retry " + String(retryCount) + "/" + String(MAX_RETRY));
-
-        if (retryCount >= MAX_RETRY)
-        {
-            Serial.println("Sending failed after max retries. Resetting state.");
-            waitingForAck = false;
-            retryCount = 0;
-            taskCheckAck.disable();
-            // clear or take other action (e.g., send HELLO again)
-            lastMessage = "";
-            lastSeqString = "";
-            lastWasHello = false;
-        }
-        else
-        {
-            // resend same lastMessage (without incrementing seq)
-            Serial.println("Resending last message: " + lastMessage);
-            mesh.sendBroadcast(lastMessage);
-            lastAckTime = millis();
-            taskCheckAck.enable();
-        }
-    }
-}
-
-// ============================================================================
-// SETUP
-// ============================================================================
 void setup()
 {
-    Serial.begin(115200);
-    Serial.println("\n\n========================================");
-    Serial.println("NodeMCU Sensor Node (fixed)");
-    Serial.println("  Node ID: " + String(NODE_ID));
-    Serial.println("  Room: " + String(ROOM_NAME));
-    Serial.println("  Sensor: " + String(SENSOR_TYPE));
-    Serial.println("========================================\n");
+  Serial.begin(115200);
+  delay(200);
 
-    // Buzzer setup
-    pinMode(BUZZER_PIN, OUTPUT);
-    digitalWrite(BUZZER_PIN, LOW);
+  // init TFT
+  gfx->begin();
+  scr_w = gfx->width();
+  scr_h = gfx->height();
+  cx = scr_w / 2;
+  cy = scr_h / 2;
+  radius = min(scr_w, scr_h) / 2 - 4; // leave tiny margin
 
-    // Sensor setup
-    dht.begin();
-    Serial.println("DHT sensor initialized.");
+  computeAreas();
+  drawStaticBackground();
 
-    // Mesh setup
-    // enable useful debug messages (ERROR | STARTUP | CONNECTION)
-    mesh.setDebugMsgTypes(ERROR | STARTUP | CONNECTION);
-    mesh.init(MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT);
+  // helper hint
+  gfx->setTextSize(1);
+  gfx->setTextColor(RGB565_WHITE);
+  gfx->setCursor(6, scr_h - 16);
+  gfx->print("Aligned values - partial updates");
 
-    // Important: tell node that root exists (helps routing when root is present)
-    mesh.setContainsRoot(true);
+  // sensor init
+  sensor.begin();
+  if (!sensor.isCalibrated()) {
+    Serial.println("Sensor not calibrated, calibrating (auto)...");
+    gfx->setTextSize(1);
+    gfx->setTextColor(RGB565_YELLOW);
+    gfx->setCursor(cx - 40, cy);
+    gfx->print("Calibrating R0...");
+    sensor.calibrateR0(100, 100);
+    delay(200);
+    drawStaticBackground();
+  } else {
+    Serial.print("R0: ");
+    Serial.println(sensor.getR0());
+  }
 
-    mesh.onReceive(&receivedCallback);
-    mesh.onNewConnection(&newConnectionCallback);
-    mesh.onChangedConnections(&changedConnectionCallback);
-    mesh.onNodeTimeAdjusted(&nodeTimeAdjustedCallback);
-
-    Serial.println("MESH network initialized.");
-
-    userScheduler.addTask(taskSendSensor);
-    userScheduler.addTask(taskCheckAck);
-
-    taskSendSensor.enable();
-
-    Serial.println("System ready!\n");
-
-    // send an initial HELLO so gateway knows this node exists
-    delay(500);
-    String hello = prepareHelloAsLast();
-    sendLastMessage();
+  lastReadMillis = millis();
 }
 
-// ============================================================================
-// LOOP
-// ============================================================================
 void loop()
 {
-    mesh.update();
+  unsigned long now = millis();
+  if (now - lastReadMillis < READ_INTERVAL) {
+    return;
+  }
+  lastReadMillis = now;
 
-    if (buzzerActive && (millis() - buzzerStartTime > ALERT_DURATION))
-    {
-        deactivateBuzzer();
-    }
+  // Warm-up handling
+  if (!sensor.isWarmedUp())
+  {
+    unsigned long remaining = sensor.getWarmupRemaining() / 1000;
+    char wb[32];
+    sprintf(wb, "Warming: %lus", remaining);
+    Area warmArea = { cx - 60, cy - 10, 120, 16 };
+    clearArea(warmArea);
+    drawValueAt(warmArea.x, warmArea.y, wb, RGB565_YELLOW, 1);
+    Serial.print("Warming... ");
+    Serial.print(remaining);
+    Serial.println("s");
+    return;
+  }
+
+  // read sensor values
+  float ppm = sensor.getPPM();
+  float Rs = sensor.getRs();
+  float ratio = sensor.getRatio();
+  sensor.updateTWA();
+  float twa = sensor.getTWA();
+  AlertLevel alert = sensor.getAlertLevel();
+
+  if (isnan(ppm))
+  {
+    clearArea(areaPPM);
+    drawValueAt(areaPPM.x, areaPPM.y + 2, "Sensor Err", RGB565_RED, 2);
+    Serial.println("Sensor read error");
+    return;
+  }
+
+  // temp buffer
+  char buf[32];
+
+  // PPM (bigger)
+  if (isnan(prev_ppm) || fabs(ppm - prev_ppm) > TH_PPM) {
+    dtostrf(ppm, 5, 2, buf);
+    clearArea(areaPPM);
+    // place value using computed area
+    drawValueAt(areaPPM.x, areaPPM.y + 2, buf, PPM_COLOR, VAL_TEXTSIZE_PPM);
+    prev_ppm = ppm;
+  }
+
+  // Rs
+  if (isnan(prev_rs) || fabs(Rs - prev_rs) > TH_RS) {
+    dtostrf(Rs, 6, 2, buf);
+    clearArea(areaRs);
+    drawValueAt(areaRs.x, areaRs.y + 2, buf, RS_COLOR, VAL_TEXTSIZE_OTHER);
+    prev_rs = Rs;
+  }
+
+  // Ratio
+  if (isnan(prev_ratio) || fabs(ratio - prev_ratio) > TH_RATIO) {
+    dtostrf(ratio, 5, 3, buf);
+    clearArea(areaRatio);
+    drawValueAt(areaRatio.x, areaRatio.y + 2, buf, RATIO_COLOR, VAL_TEXTSIZE_OTHER);
+    prev_ratio = ratio;
+  }
+
+  // TWA
+  if (isnan(prev_twa) || fabs(twa - prev_twa) > TH_TWA) {
+    dtostrf(twa, 5, 2, buf);
+    clearArea(areaTWA);
+    drawValueAt(areaTWA.x, areaTWA.y + 2, buf, TWA_COLOR, VAL_TEXTSIZE_OTHER);
+    prev_twa = twa;
+  }
+
+  // Alert
+  if (alert != prev_alert) {
+    updateAlertDisplay(alert);
+    prev_alert = alert;
+  }
+
+  // Serial full log
+  Serial.println(F("--- NH3 Reading ---"));
+  Serial.print(F("PPM: ")); Serial.print(ppm, 2); Serial.println(F(" ppm"));
+  Serial.print(F("Rs: ")); Serial.print(Rs, 2); Serial.println(F(" Ω"));
+  Serial.print(F("Ratio (Rs/R0): ")); Serial.println(ratio, 3);
+  Serial.print(F("Alert Level: ")); Serial.println(sensor.getAlertString());
+  Serial.print(F("TWA: ")); Serial.print(twa, 2); Serial.println(F(" ppm"));
+  Serial.println();
 }
